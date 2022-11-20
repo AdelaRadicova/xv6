@@ -8,6 +8,10 @@
 #define NBUCKET 5
 #define NKEYS 100000
 
+pthread_mutex_t lock; // edit: lab vlakna uloha 2
+// pole zamkov = oznacuje ci je bucket pristupny 0, alebo uz sa k nemu pristupuje 1
+int pole_zamkov[NBUCKET] = {0,0,0,0,0}; // edit: lab vlakna uloha 2
+
 struct entry {
   int key;
   int value;
@@ -41,6 +45,10 @@ void put(int key, int value)
 {
   int i = key % NBUCKET;
 
+  // ak je bucket uz spristuoneny inemu vlaknu, tak sa pristup dalsiemu vlaknu k nemu nepovoli
+  if(pole_zamkov[i] == 1) return;       // edit: lab vlakna uloha 2
+
+
   // is the key already present?
   struct entry *e = 0;
   for (e = table[i]; e != 0; e = e->next) {
@@ -52,9 +60,12 @@ void put(int key, int value)
     e->value = value;
   } else {
     // the new is new.
+    pthread_mutex_lock(&lock); // edit: lab vlakna uloha 2
     insert(key, value, &table[i], table[i]);
   }
 
+  pole_zamkov[i] = 0;   // edit: lab vlakna uloha 2, spristupni bucket
+  pthread_mutex_unlock(&lock);   // edit: lab vlakna uloha 2
 }
 
 static struct entry*
@@ -110,6 +121,7 @@ main(int argc, char *argv[])
     fprintf(stderr, "Usage: %s nthreads\n", argv[0]);
     exit(-1);
   }
+  pthread_mutex_init(&lock, NULL); // edit: lab vlakna
   nthread = atoi(argv[1]);
   tha = malloc(sizeof(pthread_t) * nthread);
   srandom(0);
