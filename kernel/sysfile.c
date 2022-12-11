@@ -16,6 +16,8 @@
 #include "file.h"
 #include "fcntl.h"
 
+static struct inode* create(char *path, short type, short major, short minor );
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -169,6 +171,137 @@ bad:
   return -1;
 }
 
+/*
+// edit: add function sym_link --> symbolic link
+// vytvori novy symbolicky odkaz umiestneny na path, ktory bude ukazovat na subor target symlink(char *target, char *path)
+// old == target new == path z nejakeho dovodu
+int
+sys_symlink(void) {
+
+  char name[DIRSIZ], new[MAXPATH], old[MAXPATH];
+  struct inode *dp, *newip;
+  int newFlag = 0;
+
+  // kontrola vstupnych argumentov, ak je niektory z nich nulovej dlzky resp chyba, tak sa systemove volanie nevie zavolat pre nedostatok argumentov
+  // old je  prvy argument == target na ktory bude druhy argument == path ukazovat
+  if (argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
+    return -1;
+
+  begin_op();  // begin_op() na vyznacenie tela systemoveho volania, funkcia inkrementuje counter in/progress FS system calls
+  
+  // Link the dirent to the newip.
+  if ((dp = nameiparent(new, name)) == 0) { // nameiparent zavola funkciu namex(path, 1, name); ktora hlada inode pre prislusnu cestu, ak najde tak vrati inode pre rodica a do premennej name ulozi nazov 
+                                            // suboru
+                                            // cize ak ku prislusnej ceste neexistuje ziaden inode znamena ze sa nejedna ani o subor ani o priecinok ani o link, skratka taka cesta neexistuje, lebo kazdy 
+                                            // subor priecinok link musi byt mapovany jednym inodom (path cesta je neplatna skratka)
+    end_op();
+    return -1;
+  }
+
+  ilock(dp);
+
+  // Alloc a new inode for symlink, and write the old path in.
+  if ((newip = dirlookup(dp, name, 0)) == 0 ) { //dirlookup() hlada direntry v danom adresari na zaklade give path name (direntry ma za ulohu previazat cestu/meno suboru s datami)
+    newFlag = 1;
+    newip = ialloc(dp->dev, O_NOFOLLOW);        // alokuje sa novy inode typu O_NOFOLLOW on given device a nastavia sa mu hodnoty
+    ilock(newip);
+    newip->nlink = 1;
+    newip->major = 0;
+    newip->minor = 0;
+    iupdate(newip);
+  }
+  else {
+    ilock(newip);
+  }
+
+  writei(newip, 0, (uint64)old, 0, MAXPATH);    // writei zapise data do inode, kedze old je target, tak do inode zapise cestu na subor na ktory chce aby symlink odkazoval
+  iunlock(newip);
+
+  if (dirlink(dp, name, newip->inum) < 0) {     // ak sa do prazdneho direntry nepodari nacitat novy direntry tak vrati -1
+    iunlockput(dp);
+    goto bad;
+  }
+
+  iunlockput(dp);
+  iput(newip);
+
+  end_op();
+  return 0;
+
+bad:
+  ilock(newip);
+  if (newFlag)
+    newip->nlink--;
+  iupdate(newip);
+  iunlockput(newip);
+  end_op();
+  return -1;
+}*/
+
+
+uint64
+sys_symlink(void) {
+
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *dp;
+
+  argstr(0, target, MAXPATH);
+  argstr(1, path, MAXPATH);
+
+  begin_op();
+  dp = create(path, T_SYMLINK, 0, 0);
+  if (dp == 0) {
+    end_op();
+    return -1;
+  }
+  if (writei(dp, 0, (uint64)target, 0, MAXPATH) != MAXPATH) {
+    iunlockput(dp);
+    end_op();
+    return -1;
+  }
+  iunlockput(dp);
+  end_op();
+  return 0;
+}
+
+
+
+// edit: added
+static int 
+rec_symlink_find(char *path, int cnt) {
+  
+  // Represent if it is a cycle
+  if (cnt > 10) {
+    return 0;
+  }
+  cnt++;
+
+  char newpath[MAXPATH];
+  struct inode *ip;
+
+  if ((ip = namei(path)) == 0) {
+    return 0;
+  }
+  ilock(ip);
+
+  // If it is the true inode, return
+  if (ip->type != T_SYMLINK) {
+    iunlockput(ip);
+    return 1;
+  }
+
+  if (readi(ip, 0, (uint64)&newpath, 0, MAXPATH) != MAXPATH) {
+    iunlockput(ip);
+    return 0;
+  }
+
+  iunlockput(ip);
+
+  memmove(path,newpath, MAXPATH);
+  return rec_symlink_find(path, cnt);
+}
+
+
 // Is the directory dp empty except for "." and ".." ?
 static int
 isdirempty(struct inode *dp)
@@ -310,6 +443,7 @@ sys_open(void)
   struct inode *ip;
   int n;
 
+
   argint(1, &omode);
   if((n = argstr(0, path, MAXPATH)) < 0)
     return -1;
@@ -323,6 +457,15 @@ sys_open(void)
       return -1;
     }
   } else {
+
+    // Make sure that its a true file, if NOT O_NOFOLLOW.
+    if ((omode & O_NOFOLLOW) == 0) {
+      if (rec_symlink_find(path, 0) == 0) {
+        end_op();
+        return -1;
+      }
+    }
+
     if((ip = namei(path)) == 0){
       end_op();
       return -1;

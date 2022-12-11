@@ -385,50 +385,101 @@ bmap(struct inode *ip, uint bn)
   uint addr, *a;
   struct buf *bp;
 
+  // edit: ak logicke cislo bloku spada do intervalu priamych blokov
   if(bn < NDIRECT){
-    if((addr = ip->addrs[bn]) == 0){
+    if((addr = ip->addrs[bn]) == 0){    // ak je najdena adresa v poli addrs daneho inodu nulova, tak sa alokuje novy blok
       addr = balloc(ip->dev);
       if(addr == 0)
         return 0;
       ip->addrs[bn] = addr;
     }
-    return addr;
+    return addr; // vraciame absolutnu adresu bloku na disku
   }
-  bn -= NDIRECT;
+  bn -= NDIRECT; // od logickeho cisla bloku odratame pocet priamych blokov, aby sme vedeli v indirect bloku indexovat normalne od zaciatku bloku
 
+  // ak logicke cislo spada do nepriameho bloku
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
-    if((addr = ip->addrs[NDIRECT]) == 0){
+    if((addr = ip->addrs[NDIRECT]) == 0){       // kontrola ci vobec indirect block existuje, ak nie, tak sa naalokuje; (ip->addrs[NDIRECT] by ukazovalo na prvu polozku za direct blokmi)
       addr = balloc(ip->dev);
       if(addr == 0)
         return 0;
       ip->addrs[NDIRECT] = addr;
     }
-    bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
-    if((addr = a[bn]) == 0){
+    bp = bread(ip->dev, addr); // precitame cely indirect block (kuk obrazok v pozn) resp najdeme si prislusnu cast bloku s adresou addr; dostaneme strukturu buff
+    a = (uint*)bp->data;      // pristupujeme ku samotnym datam na ktore ukazuje adresa addr indirect bloku
+    if((addr = a[bn]) == 0){    // ak adresa neukazuje na ziadne data resp nie je tam ziaden datovy blok, tak sa naalokuje
       addr = balloc(ip->dev);
       if(addr){
         a[bn] = addr;
+        log_write(bp);  // log_write sa vola vzdy, ked dojde ku nejakej zmene v bloku (zapis)
+      }
+    }
+    brelse(bp); // uvolnenie bloku pre pouzitie inymi vlaknami
+    return addr;
+  }
+
+
+  // ak logicke cislo spada az pod doubleindirect blok
+  bn -= NINDIRECT; // od logickeho cisla bloku odratame pocet
+
+  if(bn < NDINDIRECT){
+    // Load doubly indirect block, allocating if necessary.
+    if((addr = ip->addrs[NDIRECT+1]) == 0){       // kontrola ci vobec doublyindirect block existuje, ak nie, tak sa naalokuje; (ip->addrs[NDIRECT] by ukazovalo na prvu polozku za direct blokmi)
+      addr = balloc(ip->dev);
+      if(addr == 0)
+        return 0;
+      ip->addrs[NDIRECT+1] = addr;
+    }
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;      
+
+    // indexacia do doubly indirect bloku (to je ten co v sebe ukryva dalsie indirect tabulky)
+    uint dind_index = bn / NINDIRECT; // NINDIRECT = 256
+    // indexacia do indirect bloku (to je ten co v sebe ukryva uz len adresy na data)
+    uint ind_index = bn % NINDIRECT;
+
+    // Load indirect block, allocating if necessary.
+    if((addr = a[dind_index]) == 0){   
+      addr = balloc(ip->dev);
+      if(addr){
+        a[dind_index] = addr;
         log_write(bp);
       }
     }
     brelse(bp);
-    return addr;
-  }
 
+   // nacitanie nepriameho bloku
+   bp = bread(ip->dev, addr);
+   a = (uint*) bp->data; 
+
+   // ak tam tie data nie su, tak naalokujeme datovy blok
+   if((addr = a[ind_index]) == 0) {
+     addr = balloc(ip->dev);
+     if(addr) {
+       a[ind_index] = addr;
+       log_write(bp);
+     } 
+   }
+   brelse(bp);
+
+   return addr;
+  
+  }
   panic("bmap: out of range");
 }
 
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
+// sluzi na odstranenie obsahu suboru
 void
 itrunc(struct inode *ip)
 {
   int i, j;
-  struct buf *bp;
-  uint *a;
+  struct buf *bp, *bp2;
+  uint *a, *a2;
 
+  // vynulovanie priamych blokov
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
       bfree(ip->dev, ip->addrs[i]);
@@ -436,6 +487,7 @@ itrunc(struct inode *ip)
     }
   }
 
+  // odalokovanie datovych blokov, na ktore ukazuju indirect-blok adresy
   if(ip->addrs[NDIRECT]){
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
@@ -444,8 +496,34 @@ itrunc(struct inode *ip)
         bfree(ip->dev, a[j]);
     }
     brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT]);
+    bfree(ip->dev, ip->addrs[NDIRECT]); // uvolnenie indirect blok adries resp celej tabulky indirect blok
     ip->addrs[NDIRECT] = 0;
+  }
+
+
+
+  // odalokovavanie doubly-indirect blokov, jeho indirect blokov a jeho datovych blokov
+
+
+  // doubly/indirect blok
+  if(ip->addrs[NDIRECT+1]){     // pozerame ci sa tam nachadza dvojito nepriamy blok
+    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);  // ak ano, tak ho nacitame
+    a = (uint*)bp->data;        // pozrieme sa na to, co obsahuje
+    for(j = 0; j < NINDIRECT; j++){     // prejdeme vsetky jeho polozky -> hladame, ci sa v dvojito nepriamom bloku nachadzaju nejake nepriame bloky
+      if(a[j]) {        // ak sa najde nacitame ho a pozrieme jeho obsah
+        bp2 = bread(ip->dev, a[j]);     // bp2 = nepriamy blok
+        a2 = (uint*)bp2->data;           // a2 = obsak bloku bp2
+        for(i = 0; i < NINDIRECT; i++){ // prechadzame vsetky polozky indirect bloki
+          if(a2[i])     // ak sa najde nejaky datovy blok prisluchajuci zaznamu indirect bloku, tak sa uvolni
+            bfree(ip->dev, a2[i]);
+        }
+        brelse(bp2);    // uvolni sa indirect blok (volny pre pouzitie inych vlakien)
+        bfree(ip->dev, a[j]);   // dealokacia indirect bloku
+      }
+    }
+    brelse(bp); // uvolni sa doubly.indirect blok
+    bfree(ip->dev, ip->addrs[NDIRECT+1]);       // dealokuje sa doubly-indirect bloku
+    ip->addrs[NDIRECT+1] = 0;           // nastavime, ze doubly-indirect blok je volny
   }
 
   ip->size = 0;

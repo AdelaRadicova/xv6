@@ -3,3 +3,4 @@
 #define O_RDWR    0x002
 #define O_CREATE  0x200
 #define O_TRUNC   0x400
+#define O_NOFOLLOW 0x800        // edit: added (ak je priznak nofollow nastaveny,znamena,ze nedojde k presunu na dresu, ktoru ma link v sebe ako odkaz)
